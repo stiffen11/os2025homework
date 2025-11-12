@@ -4,10 +4,59 @@
 #include <stdbool.h>
 #include <assert.h>
 #include <testkit.h>
+#include<getopt.h>
 #include "labyrinth.h"
 
 int main(int argc, char *argv[]) {
     // TODO: Implement this function
+    const char *short_opts="m:p:";
+    char *map_file=NULL;
+    int version_flag=0;
+    int mov_flag=0;
+    int player_id=0;
+    struct option long_opts[]={
+	    {"version",no_argument,&version_flag,1},
+	    {"map",required_argument,0,"m"},
+	    {"player",required_argument,0,"p"},
+	    {"move",required_argument,&mov_flag,1},
+	    {0,0,0,0}
+    };
+int opt=0;
+    while((opt=getopt_long(argc,argv,short_opts,long_opts))!=-1){
+            switch(opt){
+		    case 'm':    
+		    	map_file=optarg;
+		    	break;
+		    case 'p':
+		    	player_id=optarg;
+		    	break;
+		default:
+			printUsage();
+			break;
+
+   }
+        if(map_file!=NULL){
+    FILE *file=fopen("../maps/filename","r");
+    if(file==NULL){
+	    perror("fail");
+	    return;
+    }
+    char buffer[256];
+    while(fgets(buffer,sizeof(buffer),file)!=NULL){
+	    printf("%s",buffer);
+    }
+    fclose(file);
+	}
+
+
+
+    if(version_flag==1){
+	    printf("version 1.0");
+    }
+    if(mov_flag==1){
+	  printf("up\ndown\nleft\nright\n");
+    }
+
     return 0;
 }
 
@@ -26,6 +75,7 @@ bool isValidPlayer(char playerId) {
 
 bool loadMap(Labyrinth *labyrinth, const char *filename) {
     // TODO: Implement this function
+
     return false;
 }
 
