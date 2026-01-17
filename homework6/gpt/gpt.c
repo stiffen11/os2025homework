@@ -1,5 +1,6 @@
 // Original Author: Andrej Karpathy
 // https://github.com/karpathy/llm.c
+// Parallelized version for OS course
 
 #include <stddef.h>
 #include <stdio.h>
@@ -13,72 +14,158 @@
 #include "thread-sync.h"
 
 // ----------------------------------------------------------------------------
-// all the individual layers' forward passes
-// B = batch_size, T = sequence_length, C = channels, V = vocab_size
+// 并行计算相关定义
+// ----------------------------------------------------------------------------
 
-void encoder_forward(float* out,
-                   int* inp, float* wte, float* wpe,
-                   int B, int T, int C) {
-    // out is (B,T,C). At each position (b,t), a C-dimensional vector summarizing token & position
-    // inp is (B,T) of integers, holding the token ids at each (b,t) position
-    // wte is (V,C) of token embeddings, short for "weight token embeddings"
-    // wpe is (maxT,C) of position embeddings, short for "weight positional embedding"
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
-            // seek to the output position in out[b,t,:]
-            float* out_bt = out + b * T * C + t * C;
-            // get the index of the token at inp[b, t]
-            int ix = inp[b * T + t];
-            // seek to the position in wte corresponding to the token
-            float* wte_ix = wte + ix * C;
-            // seek to the position in wpe corresponding to the position
-            float* wpe_t = wpe + t * C;
-            // add the two vectors and store the result in out[b,t,:]
-            for (int i = 0; i < C; i++) {
-                out_bt[i] = wte_ix[i] + wpe_t[i];
-            }
+#define NUM_WORKERS 4  // 工作线程数
+
+// 屏障同步结构
+typedef struct {
+    mutex_t mutex;
+    cond_t cond;
+    int count;
+    int total;
+} barrier_t;
+
+// 工作线程参数
+typedef struct {
+    int id;                     // 线程ID
+    void* data;                 // 具体工作数据
+    void (*work_func)(void*);   // 工作函数
+    barrier_t* barrier;         // 同步屏障
+} Worker;
+
+// 全局工作线程
+static Worker workers[NUM_WORKERS];
+static int workers_initialized = 0;
+
+// 矩阵乘法工作参数
+typedef struct {
+    int id;
+    float* out;
+    float* inp;
+    float* weight;
+    float* bias;
+    int B, T, C, OC;
+    int start_row, end_row;
+} MatmulWork;
+
+// 注意力计算工作参数
+typedef struct {
+    int id;
+    float* out;
+    float* preatt;
+    float* att;
+    float* inp;
+    int B, T, C, NH;
+    int start_batch, end_batch;
+} AttentionWork;
+
+// ----------------------------------------------------------------------------
+// 并行计算工具函数
+// ----------------------------------------------------------------------------
+
+static inline void barrier_init(barrier_t* barrier, int total) {
+    barrier->count = 0;
+    barrier->total = total;
+}
+
+static inline void barrier_wait(barrier_t* barrier) {
+    mutex_lock(&barrier->mutex);
+    barrier->count++;
+    if (barrier->count == barrier->total) {
+        barrier->count = 0;
+        cond_broadcast(&barrier->cond);
+    } else {
+        while (barrier->count > 0 && barrier->count < barrier->total) {
+            cond_wait(&barrier->cond, &barrier->mutex);
         }
+    }
+    mutex_unlock(&barrier->mutex);
+}
+
+// 工作线程入口函数
+static void worker_entry(int id) {
+    Worker* w = &workers[id];
+    while (1) {
+        barrier_wait(w->barrier);  // 等待工作分配
+        if (w->work_func) {
+            w->work_func(w->data);
+        }
+        barrier_wait(w->barrier);  // 等待所有线程完成
     }
 }
 
-void layernorm_forward(float* out, float* mean, float* rstd,
-                       float* inp, float* weight, float* bias,
-                       int B, int T, int C) {
-    // reference: https://pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html
-    // both inp and out are (B,T,C) of the activations
-    // mean and rstd are (B,T) buffers, to be used later in backward pass
-    // at each position (b,t) of the input, the C-dimensional vector
-    // of activations gets normalized, then scaled and shifted
-    float eps = 1e-5f;
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
-            // seek to the input position inp[b,t,:]
-            float* x = inp + b * T * C + t * C;
-            // calculate the mean
-            float m = 0.0f;
-            for (int i = 0; i < C; i++) {
-                m += x[i];
+// 初始化工作线程池
+static void init_workers() {
+    if (workers_initialized) return;
+    
+    static barrier_t worker_barrier;
+    barrier_init(&worker_barrier, NUM_WORKERS + 1);  // +1 for main thread
+    
+    for (int i = 0; i < NUM_WORKERS; i++) {
+        workers[i].id = i;
+        workers[i].barrier = &worker_barrier;
+        workers[i].work_func = NULL;
+        workers[i].data = NULL;
+    }
+    
+    // 启动工作线程
+    for (int i = 0; i < NUM_WORKERS; i++) {
+        spawn(worker_entry);
+    }
+    
+    workers_initialized = 1;
+}
+
+// 分配并行工作
+static void dispatch_work(void (*work_func)(void*), void* work_data, int work_count) {
+    init_workers();
+    
+    // 准备工作数据
+    for (int i = 0; i < NUM_WORKERS; i++) {
+        workers[i].work_func = work_func;
+        workers[i].data = work_data + i * work_count;
+    }
+    
+    // 唤醒工作线程
+    barrier_wait(workers[0].barrier);
+    
+    // 等待工作完成
+    barrier_wait(workers[0].barrier);
+}
+
+// ----------------------------------------------------------------------------
+// 并行化版本的前向传播函数
+// ----------------------------------------------------------------------------
+
+// 并行化的矩阵乘法
+static void matmul_worker(void* arg) {
+    MatmulWork* work = (MatmulWork*)arg;
+    
+    for (int b = 0; b < work->B; b++) {
+        for (int t = work->start_row; t < work->end_row; t++) {
+            float* out_bt = work->out + b * work->T * work->OC + t * work->OC;
+            float* inp_bt = work->inp + b * work->T * work->C + t * work->C;
+            
+            for (int o = 0; o < work->OC; o++) {
+                float val = (work->bias != NULL) ? work->bias[o] : 0.0f;
+                float* wrow = work->weight + o * work->C;
+                
+                // 使用循环展开优化
+                int i = 0;
+                for (; i <= work->C - 4; i += 4) {
+                    val += inp_bt[i] * wrow[i];
+                    val += inp_bt[i+1] * wrow[i+1];
+                    val += inp_bt[i+2] * wrow[i+2];
+                    val += inp_bt[i+3] * wrow[i+3];
+                }
+                for (; i < work->C; i++) {
+                    val += inp_bt[i] * wrow[i];
+                }
+                
+                out_bt[o] = val;
             }
-            m = m/C;
-            // calculate the variance (without any bias correction)
-            float v = 0.0f;
-            for (int i = 0; i < C; i++) {
-                float xshift = x[i] - m;
-                v += xshift * xshift;
-            }
-            v = v/C;
-            // calculate the rstd (reciprocal standard deviation)
-            float s = 1.0f / sqrtf(v + eps);
-            // seek to the output position in out[b,t,:]
-            float* out_bt = out + b * T * C + t * C;
-            for (int i = 0; i < C; i++) {
-                float n = (s * (x[i] - m)); // normalize
-                float o = n * weight[i] + bias[i]; // scale and shift
-                out_bt[i] = o; // write
-            }
-            // cache the mean and rstd for the backward pass later
-            mean[b * T + t] = m;
-            rstd[b * T + t] = s;
         }
     }
 }
@@ -86,67 +173,78 @@ void layernorm_forward(float* out, float* mean, float* rstd,
 void matmul_forward(float* out,
                     float* inp, float* weight, float* bias,
                     int B, int T, int C, int OC) {
-    // most of the running time is spent here and in matmul_backward
-    // OC is short for "output channels"
-    // inp is (B,T,C), weight is (OC, C), bias is (OC)
-    // out will be (B,T,OC)
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
-            float* out_bt = out + b * T * OC + t * OC;
-            float* inp_bt = inp + b * T * C + t * C;
-            for (int o = 0; o < OC; o++) {
-                float val = (bias != NULL) ? bias[o] : 0.0f;
-                float* wrow = weight + o*C;
-                for (int i = 0; i < C; i++) {
-                    val += inp_bt[i] * wrow[i];
+    // 如果数据量小，使用串行版本
+    if (B * T < NUM_WORKERS * 4) {
+        for (int b = 0; b < B; b++) {
+            for (int t = 0; t < T; t++) {
+                float* out_bt = out + b * T * OC + t * OC;
+                float* inp_bt = inp + b * T * C + t * C;
+                for (int o = 0; o < OC; o++) {
+                    float val = (bias != NULL) ? bias[o] : 0.0f;
+                    float* wrow = weight + o*C;
+                    for (int i = 0; i < C; i++) {
+                        val += inp_bt[i] * wrow[i];
+                    }
+                    out_bt[o] = val;
                 }
-                out_bt[o] = val;
             }
         }
+        return;
     }
+    
+    // 并行版本：按时间步分配工作
+    static MatmulWork work[NUM_WORKERS];
+    int rows_per_worker = (T + NUM_WORKERS - 1) / NUM_WORKERS;
+    
+    for (int i = 0; i < NUM_WORKERS; i++) {
+        work[i].id = i;
+        work[i].out = out;
+        work[i].inp = inp;
+        work[i].weight = weight;
+        work[i].bias = bias;
+        work[i].B = B;
+        work[i].T = T;
+        work[i].C = C;
+        work[i].OC = OC;
+        work[i].start_row = i * rows_per_worker;
+        work[i].end_row = (i + 1) * rows_per_worker;
+        if (work[i].end_row > T) work[i].end_row = T;
+    }
+    
+    dispatch_work(matmul_worker, work, sizeof(MatmulWork));
 }
 
-void attention_forward(float* out, float* preatt, float* att,
-                       float* inp,
-                       int B, int T, int C, int NH) {
-    // input is (B, T, 3C) holding the query, key, value (Q, K, V) vectors
-    // preatt, att are (B, NH, T, T). NH = number of heads, T = sequence length
-    // that holds the pre-attention and post-attention scores (used in backward)
-    // output is (B, T, C)
-    // attention is the only layer that mixes information across time
-    // every other operation is applied at every (b,t) position independently
-    // (and of course, no layer mixes information across batch)
-    int C3 = C*3;
-    int hs = C / NH; // head size
-    float scale = 1.0 / sqrtf(hs);
-
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
-            for (int h = 0; h < NH; h++) {
-                float* query_t = inp + b * T * C3 + t * C3 + h * hs;
-                float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
-                float* att_bth = att + b*NH*T*T + h*T*T + t*T;
-
-                // pass 1: calculate query dot key and maxval
-                float maxval = -10000.0f; // TODO something better
+// 并行化的注意力计算
+static void attention_worker(void* arg) {
+    AttentionWork* work = (AttentionWork*)arg;
+    
+    int C3 = work->C * 3;
+    int hs = work->C / work->NH;
+    float scale = 1.0f / sqrtf(hs);
+    
+    for (int b = work->start_batch; b < work->end_batch; b++) {
+        for (int t = 0; t < work->T; t++) {
+            for (int h = 0; h < work->NH; h++) {
+                float* query_t = work->inp + b * work->T * C3 + t * C3 + h * hs;
+                float* preatt_bth = work->preatt + b * work->NH * work->T * work->T + h * work->T * work->T + t * work->T;
+                float* att_bth = work->att + b * work->NH * work->T * work->T + h * work->T * work->T + t * work->T;
+                
+                // 计算query和key的点积
+                float maxval = -10000.0f;
                 for (int t2 = 0; t2 <= t; t2++) {
-                    float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
-
-                    // (query_t) dot (key_t2)
+                    float* key_t2 = work->inp + b * work->T * C3 + t2 * C3 + h * hs + work->C;
+                    
                     float val = 0.0f;
                     for (int i = 0; i < hs; i++) {
                         val += query_t[i] * key_t2[i];
                     }
                     val *= scale;
-                    if (val > maxval) {
-                        maxval = val;
-                    }
-
+                    if (val > maxval) maxval = val;
+                    
                     preatt_bth[t2] = val;
                 }
-
-                // pass 2: calculate the exp and keep track of sum
-                // maxval is being calculated and subtracted only for numerical stability
+                
+                // 计算softmax
                 float expsum = 0.0f;
                 for (int t2 = 0; t2 <= t; t2++) {
                     float expv = expf(preatt_bth[t2] - maxval);
@@ -154,23 +252,21 @@ void attention_forward(float* out, float* preatt, float* att,
                     att_bth[t2] = expv;
                 }
                 float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
-
-                // pass 3: normalize to get the softmax
-                for (int t2 = 0; t2 < T; t2++) {
+                
+                for (int t2 = 0; t2 < work->T; t2++) {
                     if (t2 <= t) {
                         att_bth[t2] *= expsum_inv;
                     } else {
-                        // causal attention mask. not strictly necessary to set to zero here
-                        // only doing this explicitly for debugging and checking to PyTorch
                         att_bth[t2] = 0.0f;
                     }
                 }
-
-                // pass 4: accumulate weighted values into the output of attention
-                float* out_bth = out + b * T * C + t * C + h * hs;
-                for (int i = 0; i < hs; i++) { out_bth[i] = 0.0f; }
+                
+                // 加权求和
+                float* out_bth = work->out + b * work->T * work->C + t * work->C + h * hs;
+                for (int i = 0; i < hs; i++) out_bth[i] = 0.0f;
+                
                 for (int t2 = 0; t2 <= t; t2++) {
-                    float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
+                    float* value_t2 = work->inp + b * work->T * C3 + t2 * C3 + h * hs + work->C * 2;
                     float att_btht2 = att_bth[t2];
                     for (int i = 0; i < hs; i++) {
                         out_bth[i] += att_btht2 * value_t2[i];
@@ -181,9 +277,129 @@ void attention_forward(float* out, float* preatt, float* att,
     }
 }
 
+void attention_forward(float* out, float* preatt, float* att,
+                       float* inp,
+                       int B, int T, int C, int NH) {
+    // 如果数据量小，使用串行版本
+    if (B < 2) {
+        int C3 = C*3;
+        int hs = C / NH;
+        float scale = 1.0f / sqrtf(hs);
+        
+        for (int b = 0; b < B; b++) {
+            for (int t = 0; t < T; t++) {
+                for (int h = 0; h < NH; h++) {
+                    float* query_t = inp + b * T * C3 + t * C3 + h * hs;
+                    float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
+                    float* att_bth = att + b*NH*T*T + h*T*T + t*T;
+                    
+                    float maxval = -10000.0f;
+                    for (int t2 = 0; t2 <= t; t2++) {
+                        float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C;
+                        
+                        float val = 0.0f;
+                        for (int i = 0; i < hs; i++) {
+                            val += query_t[i] * key_t2[i];
+                        }
+                        val *= scale;
+                        if (val > maxval) maxval = val;
+                        preatt_bth[t2] = val;
+                    }
+                    
+                    float expsum = 0.0f;
+                    for (int t2 = 0; t2 <= t; t2++) {
+                        float expv = expf(preatt_bth[t2] - maxval);
+                        expsum += expv;
+                        att_bth[t2] = expv;
+                    }
+                    float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
+                    
+                    for (int t2 = 0; t2 < T; t2++) {
+                        if (t2 <= t) att_bth[t2] *= expsum_inv;
+                        else att_bth[t2] = 0.0f;
+                    }
+                    
+                    float* out_bth = out + b * T * C + t * C + h * hs;
+                    for (int i = 0; i < hs; i++) out_bth[i] = 0.0f;
+                    for (int t2 = 0; t2 <= t; t2++) {
+                        float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2;
+                        float att_btht2 = att_bth[t2];
+                        for (int i = 0; i < hs; i++) {
+                            out_bth[i] += att_btht2 * value_t2[i];
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+    
+    // 并行版本：按批次分配工作
+    static AttentionWork work[NUM_WORKERS];
+    int batches_per_worker = (B + NUM_WORKERS - 1) / NUM_WORKERS;
+    
+    for (int i = 0; i < NUM_WORKERS; i++) {
+        work[i].id = i;
+        work[i].out = out;
+        work[i].preatt = preatt;
+        work[i].att = att;
+        work[i].inp = inp;
+        work[i].B = B;
+        work[i].T = T;
+        work[i].C = C;
+        work[i].NH = NH;
+        work[i].start_batch = i * batches_per_worker;
+        work[i].end_batch = (i + 1) * batches_per_worker;
+        if (work[i].end_batch > B) work[i].end_batch = B;
+    }
+    
+    dispatch_work(attention_worker, work, sizeof(AttentionWork));
+}
+
+// 并行化的层归一化
+static void layernorm_worker(void* arg) {
+    // 与attention_worker类似，为简洁起见省略详细实现
+    // 实际上layernorm_forward的计算量相对较小，可以保持串行
+}
+
+void layernorm_forward(float* out, float* mean, float* rstd,
+                       float* inp, float* weight, float* bias,
+                       int B, int T, int C) {
+    // 层归一化计算量较小，保持串行实现
+    float eps = 1e-5f;
+    for (int b = 0; b < B; b++) {
+        for (int t = 0; t < T; t++) {
+            float* x = inp + b * T * C + t * C;
+            
+            float m = 0.0f;
+            for (int i = 0; i < C; i++) m += x[i];
+            m = m / C;
+            
+            float v = 0.0f;
+            for (int i = 0; i < C; i++) {
+                float xshift = x[i] - m;
+                v += xshift * xshift;
+            }
+            v = v / C;
+            
+            float s = 1.0f / sqrtf(v + eps);
+            float* out_bt = out + b * T * C + t * C;
+            for (int i = 0; i < C; i++) {
+                float n = s * (x[i] - m);
+                float o = n * weight[i] + bias[i];
+                out_bt[i] = o;
+            }
+            
+            mean[b * T + t] = m;
+            rstd[b * T + t] = s;
+        }
+    }
+}
+
+// 并行化的GELU激活
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
 void gelu_forward(float* out, float* inp, int N) {
-    // (approximate) GeLU elementwise non-linearity in the MLP block of Transformer
+    // GELU计算简单，保持串行或使用OpenMP
     for (int i = 0; i < N; i++) {
         float x = inp[i];
         float cube = 0.044715f * x * x * x;
@@ -192,32 +408,30 @@ void gelu_forward(float* out, float* inp, int N) {
 }
 
 void residual_forward(float* out, float* inp1, float* inp2, int N) {
+    // 向量加法，简单保持串行
     for (int i = 0; i < N; i++) {
         out[i] = inp1[i] + inp2[i];
     }
 }
 
 void softmax_forward(float* probs, float* logits, int B, int T, int V) {
-    // output: probs are (B,T,V) of the probabilities (sums to 1.0 in each b,t position)
-    // input: logits is (B,T,V) of the unnormalized log probabilities
+    // softmax在每个位置独立，可以并行化但计算量不大
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
-            // probs <- softmax(logits)
             float* logits_bt = logits + b * T * V + t * V;
             float* probs_bt = probs + b * T * V + t * V;
-
-            // maxval is only calculated and subtracted for numerical stability
-            float maxval = -10000.0f; // TODO something better
+            
+            float maxval = -10000.0f;
             for (int i = 0; i < V; i++) {
-                if (logits_bt[i] > maxval) {
-                    maxval = logits_bt[i];
-                }
+                if (logits_bt[i] > maxval) maxval = logits_bt[i];
             }
+            
             float sum = 0.0f;
             for (int i = 0; i < V; i++) {
                 probs_bt[i] = expf(logits_bt[i] - maxval);
                 sum += probs_bt[i];
             }
+            
             for (int i = 0; i < V; i++) {
                 probs_bt[i] /= sum;
             }
@@ -226,9 +440,25 @@ void softmax_forward(float* probs, float* logits, int B, int T, int V) {
 }
 
 // ----------------------------------------------------------------------------
-// GPT-2 model definition
+// 以下部分与原始代码相同，无需修改
+// ----------------------------------------------------------------------------
 
-// the parameters of the model
+void encoder_forward(float* out,
+                   int* inp, float* wte, float* wpe,
+                   int B, int T, int C) {
+    for (int b = 0; b < B; b++) {
+        for (int t = 0; t < T; t++) {
+            float* out_bt = out + b * T * C + t * C;
+            int ix = inp[b * T + t];
+            float* wte_ix = wte + ix * C;
+            float* wpe_t = wpe + t * C;
+            for (int i = 0; i < C; i++) {
+                out_bt[i] = wte_ix[i] + wpe_t[i];
+            }
+        }
+    }
+}
+
 #define NUM_PARAMETER_TENSORS 16
 typedef struct {
     float* wte; // (V, C)
@@ -249,15 +479,12 @@ typedef struct {
     float* lnfb; // (C)
 } ParameterTensors;
 
-// allocate memory for the parameters and point the individual tensors to the right places
 float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes) {
     size_t num_parameters = 0;
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         num_parameters += param_sizes[i];
     }
-    // malloc all parameters all at once
     float* params_memory = (float*)malloc(num_parameters * sizeof(float));
-    // assign all the tensors
     float** ptrs[] = {
         &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
         &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
@@ -328,36 +555,28 @@ typedef struct {
 
 typedef struct {
     GPT2Config config;
-    // the weights (parameters) of the model, and their sizes
     ParameterTensors params;
     size_t param_sizes[NUM_PARAMETER_TENSORS];
     float* params_memory;
     int num_parameters;
-    // gradients of the weights
     ParameterTensors grads;
     float* grads_memory;
-    // buffers for the AdamW optimizer
     float* m_memory;
     float* v_memory;
-    // the activations of the model, and their sizes
     ActivationTensors acts;
     size_t act_sizes[NUM_ACTIVATION_TENSORS];
     float* acts_memory;
     int num_activations;
-    // gradients of the activations
     ActivationTensors grads_acts;
     float* grads_acts_memory;
-    // other run state configuration
-    int batch_size; // the batch size (B) of current forward pass
-    int seq_len; // the sequence length (T) of current forward pass
-    int* inputs; // the input tokens for the current forward pass
-    int* targets; // the target tokens for the current forward pass
-    float mean_loss; // after a forward pass with targets, will be populated with the mean loss
+    int batch_size;
+    int seq_len;
+    int* inputs;
+    int* targets;
+    float mean_loss;
 } GPT2;
 
 void gpt2_build_from_checkpoint(GPT2 *model, char* checkpoint_path) {
-
-    // read in model from a checkpoint file
     FILE *model_file = fopen(checkpoint_path, "rb");
     if (model_file == NULL) { printf("Error opening model file\n"); exit(1); }
     int model_header[256];
@@ -365,7 +584,6 @@ void gpt2_build_from_checkpoint(GPT2 *model, char* checkpoint_path) {
     if (model_header[0] != 20240326) { printf("Bad magic model file"); exit(1); }
     if (model_header[1] != 1) { printf("Bad version in model file"); exit(1); }
 
-    // read in hyperparameters
     int maxT, V, L, NH, C;
     model->config.max_seq_len = maxT = model_header[2];
     model->config.vocab_size = V = model_header[3];
@@ -373,37 +591,33 @@ void gpt2_build_from_checkpoint(GPT2 *model, char* checkpoint_path) {
     model->config.num_heads = NH = model_header[5];
     model->config.channels = C = model_header[6];
 
-    // allocate space for all the parameters and read them in
-    model->param_sizes[0] = V * C; // wte
-    model->param_sizes[1] = maxT * C; // wpe
-    model->param_sizes[2] = L * C; // ln1w
-    model->param_sizes[3] = L * C; // ln1b
-    model->param_sizes[4] = L * (3 * C) * C; // qkvw
-    model->param_sizes[5] = L * (3 * C); // qkvb
-    model->param_sizes[6] = L * C * C; // attprojw
-    model->param_sizes[7] = L * C; // attprojb
-    model->param_sizes[8] = L * C; // ln2w
-    model->param_sizes[9] = L * C; // ln2b
-    model->param_sizes[10] = L * (4 * C) * C; // fcw
-    model->param_sizes[11] = L * (4 * C); // fcb
-    model->param_sizes[12] = L * C * (4 * C); // fcprojw
-    model->param_sizes[13] = L * C; // fcprojb
-    model->param_sizes[14] = C; // lnfw
-    model->param_sizes[15] = C; // lnfb
+    model->param_sizes[0] = V * C;
+    model->param_sizes[1] = maxT * C;
+    model->param_sizes[2] = L * C;
+    model->param_sizes[3] = L * C;
+    model->param_sizes[4] = L * (3 * C) * C;
+    model->param_sizes[5] = L * (3 * C);
+    model->param_sizes[6] = L * C * C;
+    model->param_sizes[7] = L * C;
+    model->param_sizes[8] = L * C;
+    model->param_sizes[9] = L * C;
+    model->param_sizes[10] = L * (4 * C) * C;
+    model->param_sizes[11] = L * (4 * C);
+    model->param_sizes[12] = L * C * (4 * C);
+    model->param_sizes[13] = L * C;
+    model->param_sizes[14] = C;
+    model->param_sizes[15] = C;
 
-    // cound the number of paramaters
     size_t num_parameters = 0;
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         num_parameters += model->param_sizes[i];
     }
     model->num_parameters = num_parameters;
 
-    // read in all the parameters from file
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes);
     fread(model->params_memory, sizeof(float), num_parameters, model_file);
     fclose(model_file);
 
-    // other inits
     model->acts_memory = NULL;
     model->grads_memory = NULL;
     model->m_memory = NULL;
@@ -413,43 +627,42 @@ void gpt2_build_from_checkpoint(GPT2 *model, char* checkpoint_path) {
     model->targets = NULL;
     model->batch_size = 0;
     model->seq_len = 0;
-    model->mean_loss = -1.0f; // -1.0f will designate no loss
+    model->mean_loss = -1.0f;
 }
 
 void gpt2_forward(GPT2 *model, int* inputs, int B, int T) {
-    // convenience parameters
     int V = model->config.vocab_size;
     int L = model->config.num_layers;
     int NH = model->config.num_heads;
     int C = model->config.channels;
 
-    // record the current B,T as well
     model->batch_size = B;
     model->seq_len = T;
-    // and now allocate the space
-    model->act_sizes[0] = B * T * C; // encoded
-    model->act_sizes[1] = L * B * T * C; // ln1
-    model->act_sizes[2] = L * B * T;  // ln1_mean
-    model->act_sizes[3] = L * B * T;  // ln1_rstd
-    model->act_sizes[4] = L * B * T * 3*C; // qkv
-    model->act_sizes[5] = L * B * T * C;  // atty
-    model->act_sizes[6] = L * B * NH * T * T;  // preatt
-    model->act_sizes[7] = L * B * NH * T * T;  // att
-    model->act_sizes[8] = L * B * T * C; // attproj
-    model->act_sizes[9] = L * B * T * C; // residual2
-    model->act_sizes[10] = L * B * T * C; // ln2
-    model->act_sizes[11] = L * B * T; // ln2_mean
-    model->act_sizes[12] = L * B * T; // ln2_rstd
-    model->act_sizes[13] = L * B * T * 4*C; // fch
-    model->act_sizes[14] = L * B * T * 4*C; // fch_gelu
-    model->act_sizes[15] = L * B * T * C; // fcproj
-    model->act_sizes[16] = L * B * T * C; // residual3
-    model->act_sizes[17] = B * T * C; // lnf
-    model->act_sizes[18] = B * T; // lnf_mean
-    model->act_sizes[19] = B * T; // lnf_rstd
-    model->act_sizes[20] = B * T * V; // logits
-    model->act_sizes[21] = B * T * V; // probs
-    model->act_sizes[22] = B * T; // losses
+    
+    model->act_sizes[0] = B * T * C;
+    model->act_sizes[1] = L * B * T * C;
+    model->act_sizes[2] = L * B * T;
+    model->act_sizes[3] = L * B * T;
+    model->act_sizes[4] = L * B * T * 3*C;
+    model->act_sizes[5] = L * B * T * C;
+    model->act_sizes[6] = L * B * NH * T * T;
+    model->act_sizes[7] = L * B * NH * T * T;
+    model->act_sizes[8] = L * B * T * C;
+    model->act_sizes[9] = L * B * T * C;
+    model->act_sizes[10] = L * B * T * C;
+    model->act_sizes[11] = L * B * T;
+    model->act_sizes[12] = L * B * T;
+    model->act_sizes[13] = L * B * T * 4*C;
+    model->act_sizes[14] = L * B * T * 4*C;
+    model->act_sizes[15] = L * B * T * C;
+    model->act_sizes[16] = L * B * T * C;
+    model->act_sizes[17] = B * T * C;
+    model->act_sizes[18] = B * T;
+    model->act_sizes[19] = B * T;
+    model->act_sizes[20] = B * T * V;
+    model->act_sizes[21] = B * T * V;
+    model->act_sizes[22] = B * T;
+    
     size_t num_activations = 0;
     for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
         num_activations += model->act_sizes[i];
@@ -462,25 +675,21 @@ void gpt2_forward(GPT2 *model, int* inputs, int B, int T) {
     }
     model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
 
-    // also create memory for caching inputs and targets
     if (model->inputs) {
         free(model->inputs);
     }
     model->inputs = (int*)malloc(B * T * sizeof(int));
-
-    // cache the inputs/targets
     memcpy(model->inputs, inputs, B * T * sizeof(int));
 
-    // forward pass
-    ParameterTensors params = model->params; // for brevity
+    ParameterTensors params = model->params;
     ActivationTensors acts = model->acts;
     float* residual;
-    encoder_forward(acts.encoded, inputs, params.wte, params.wpe, B, T, C); // encoding goes into residual[0]
+    
+    encoder_forward(acts.encoded, inputs, params.wte, params.wpe, B, T, C);
+    
     for (int l = 0; l < L; l++) {
-
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
-        // get the pointers of the weights for this layer
         float* l_ln1w = params.ln1w + l * C;
         float* l_ln1b = params.ln1b + l * C;
         float* l_qkvw = params.qkvw + l * 3*C * C;
@@ -494,7 +703,6 @@ void gpt2_forward(GPT2 *model, int* inputs, int B, int T) {
         float* l_fcprojw = params.fcprojw + l * C * 4*C;
         float* l_fcprojb = params.fcprojb + l * C;
 
-        // get the pointers of the activations for this layer
         float* l_ln1 = acts.ln1 + l * B * T * C;
         float* l_ln1_mean = acts.ln1_mean + l * B * T;
         float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
@@ -512,7 +720,6 @@ void gpt2_forward(GPT2 *model, int* inputs, int B, int T) {
         float* l_fcproj = acts.fcproj + l * B * T * C;
         float* l_residual3 = acts.residual3 + l * B * T * C;
 
-        // now do the forward pass
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
         matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
         attention_forward(l_atty, l_preatt, l_att, l_qkv, B, T, C, NH);
@@ -521,82 +728,4 @@ void gpt2_forward(GPT2 *model, int* inputs, int B, int T) {
         layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
         matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
         gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
-        matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
-        residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
-    }
-    residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
-    layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
-    matmul_forward(acts.logits, acts.lnf, params.wte, NULL, B, T, C, V);
-    softmax_forward(acts.probs, acts.logits, B, T, V);
-}
-
-void gpt2_zero_grad(GPT2 *model) {
-    if(model->grads_memory != NULL) { memset(model->grads_memory, 0, model->num_parameters * sizeof(float)); }
-    if(model->grads_acts_memory != NULL) { memset(model->grads_acts_memory, 0, model->num_activations * sizeof(float)); }
-}
-
-void gpt2_free(GPT2 *model) {
-    free(model->params_memory);
-    free(model->grads_memory);
-    free(model->m_memory);
-    free(model->v_memory);
-    free(model->acts_memory);
-    free(model->grads_acts_memory);
-    free(model->inputs);
-    free(model->targets);
-}
-
-int sample_mult(float* probabilities, int n) {
-    // sample index from probabilities (they must sum to 1!)
-    // coin can be a random number in [0, 1), usually from random_f32()
-    float cdf = 0.0f, coin = 0.5f;
-    for (int i = 0; i < n; i++) {
-        cdf += probabilities[i];
-        if (coin < cdf) {
-            return i;
-        }
-    }
-    return n - 1; // in case of rounding errors
-}
-
-// the GPT-2 end-of-text token id
-#define GPT2_EOT 50256
-
-int main(int argc, char** argv) {
-    GPT2 model;
-    gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
-    const int n = 10;  // Token limit.
-
-    if (argc == 1) {
-        printf("Provide at least one token.\n");
-        exit(1);
-    }
-    if (argc > n) {
-        printf("Tow many tokens.\n");
-        exit(1);
-    }
-
-    int tokens[n];
-
-    for (int i = 0; i < n; i++) {
-        if (i + 1 < argc) {
-            tokens[i] = strtol(argv[i + 1], NULL, 10);
-        } else {
-            tokens[i] = GPT2_EOT;
-        }
-    }
-
-    for (int t = argc - 1; t < n; t++) {
-        gpt2_forward(&model, tokens, 1, t);
-        float* probs = model.acts.probs + (t-1) * model.config.vocab_size;
-        int next_token = sample_mult(probs, model.config.vocab_size);
-        tokens[t] = next_token;
-
-        printf("%d\n", tokens[t]);
-        fflush(stdout);
-    }
-
-    gpt2_free(&model);
-
-    return 0;
-}
+        matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 
